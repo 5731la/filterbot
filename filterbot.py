@@ -20,9 +20,8 @@ BOT_PASSWORD = "changeme123!"
 
 DB_FILE = "filter_bot.db"
 
-
-REPLY_BODY_PREFIX = "I analyzed your attachments. Here is the proposed filter:"
-REPLY_BODY_SUFFIX = "Reply to this email to accept it. If you want to modify it, paste your edited version in your reply."
+REPLY_BODY_PREFIX = "# I analyzed your attachments. Here is the proposed filter:"
+REPLY_BODY_SUFFIX = "# Reply to this email to accept it. If you want to modify it, paste your edited version in your reply."
 
 # --- DATABASE SETUP ---
 def init_db():
@@ -105,20 +104,26 @@ def analyze_emls(eml_parts):
     best_from_addr, from_addr_count = get_top_match(from_addresses)
     best_domain, domain_count = get_top_match(from_domains)
     best_to_plus, to_plus_count = get_top_match(to_plus_addresses)
-    
-    sieve_script = None
 
+    print(f"Top From Address: {best_from_addr} (Count: {from_addr_count})")
+    print(f"Top Domain: {best_domain} (Count: {domain_count})")
+    print(f"Top To+ Address: {best_to_plus} (Count: {to_plus_count})")
+
+    to_plus_sieve_script = f'''#if allof (address :is "To" "{best_to_plus}") {{\n#    fileinto "Junk";\n#    addflag "Junk";\n#    stop;\n#}}'''
+    from_addr_sieve_script = f'''#if allof (header :contains "From" "{best_from_addr}") {{\n#    fileinto "Junk";\n#    addflag "Junk";\n#   stop;\n#}}'''
+    domain_sieve_script = f'''#if allof (header :is "From" "{best_domain}") {{\n#    fileinto "Junk";\n#    addflag "Junk";\n#   stop;\n#}}'''
+    base_domain_sieve_script = f'''#if allof (header :contains "From" "{best_domain}") {{\n#    fileinto "Junk";\n#    addflag "Junk";\n#   stop;\n#}}'''
     # 3. Priority Logic
     if to_plus_count == total_emls:
-        sieve_script = f'''if allof (address :is "To" "{best_to_plus}") {{\n    fileinto "Junk";\n    addflag "Junk";\n    stop;\n}}'''
+        to_plus_sieve_script=to_plus_sieve_script.replace('#', '')
     elif from_addr_count == total_emls:
-        sieve_script = f'''if allof (header :contains "From" "{best_from_addr}") {{\n    fileinto "Junk";\n    addflag "Junk";\n   stop;\n}}'''
+        from_addr_sieve_script=from_addr_sieve_script.replace('#', '')
     elif domain_count == total_emls:
-        sieve_script = f'''if allof (header :contains "From" "{best_domain}") {{\n    fileinto "Junk";\n    addflag "Junk";\n   stop;\n}}'''
+        domain_sieve_script=domain_sieve_script.replace('#', '')
     elif domain_count > (total_emls * 0.6):
-        sieve_script = f'''if allof (header :contains "From" "{best_domain}") {{\n    fileinto "Junk";\n    addflag "Junk";\n   stop;\n}}'''
+        base_domain_sieve_script=base_domain_sieve_script.replace('#', '')
     
-    return sieve_script
+    return '\n'.join([to_plus_sieve_script, from_addr_sieve_script, domain_sieve_script, base_domain_sieve_script])
 
 # --- MANAGESIEVE INTEGRATION ---
 def apply_sieve_filter(user_email, sieve_script):
@@ -193,6 +198,7 @@ def process_inbox():
 
     status, messages = mail.search(None, 'UNSEEN')
     if status != 'OK' or not messages[0]:
+        print("no new messages")
         mail.logout()
         return
 
@@ -210,6 +216,7 @@ def process_inbox():
         
         # SCENARIO 1: It's a reply to a proposed filter
         if in_reply_to:
+            print("processing email reply")
             c.execute("SELECT proposed_filter FROM pending_filters WHERE message_id=?", (in_reply_to,))
             row = c.fetchone()
             if row:
@@ -220,6 +227,8 @@ def process_inbox():
                         continue
                     ln = ln[2:]
                     if len(ln) == 0:
+                        continue
+                    if ln.startswith('#'):
                         continue
                     # seems like wrapping usually happens at about 65 chars not including `> `?
                     if REPLY_BODY_PREFIX[:60] in ln:
@@ -245,22 +254,26 @@ def process_inbox():
         
         # SCENARIO 2: It's a new submission with .eml attachments
         eml_parts = [part for part in msg.iter_attachments() if part.get_filename() and part.get_filename().endswith('.eml')]
-        
-        if eml_parts:
-            # Pre-flight check: Ensure the user is registered before doing work
-            if not get_app_password(user_email):
-                error_body = "I received your emails, but you do not have an App Password registered with me. Please generate an App Password in Mailcow, add it to my database, and forward the emails again."
-                send_email(user_email, "Registration Required", error_body, msg_id)
-                continue
+       
+        if not eml_parts:
+            print("invalid email sent, not a reply and no eml's attached, found these attachments:", (part.get_filename() for part in msg.iter_attachments()))
+            continue
 
-            proposed_sieve = analyze_emls(eml_parts)
-            if proposed_sieve:
-                reply_body = f"{REPLY_BODY_PREFIX}\n\n{proposed_sieve}\n\n{REPLY_BODY_SUFFIX}"
-                reply_msg_id = send_email(user_email, "Re: " + str(msg.get('Subject')), reply_body, msg_id)
-                
-                c.execute("INSERT INTO pending_filters (message_id, user_email, proposed_filter) VALUES (?, ?, ?)", 
-                          (reply_msg_id, user_email, proposed_sieve))
-                conn.commit()
+        print("processing new filter request")
+        # Pre-flight check: Ensure the user is registered before doing work
+        if not get_app_password(user_email):
+            error_body = "I received your emails, but you do not have an App Password registered with me. Please generate an App Password in Mailcow, add it to my database, and forward the emails again."
+            send_email(user_email, "Registration Required", error_body, msg_id)
+            continue
+
+        proposed_sieve = analyze_emls(eml_parts)
+        if proposed_sieve:
+            reply_body = f"{REPLY_BODY_PREFIX}\n\n{proposed_sieve}\n\n{REPLY_BODY_SUFFIX}"
+            reply_msg_id = send_email(user_email, "Re: " + str(msg.get('Subject')), reply_body, msg_id)
+            
+            c.execute("INSERT INTO pending_filters (message_id, user_email, proposed_filter) VALUES (?, ?, ?)", 
+                      (reply_msg_id, user_email, proposed_sieve))
+            conn.commit()
 
     mail.logout()
     conn.close()
